@@ -1,94 +1,88 @@
 import cv2
 import numpy as np
+import argparse
+import time
 
 
-# Function to perform advanced dehazing using dark channel prior
-def dehaze(frame):
-    # Convert the frame to float32
-    frame = frame.astype(np.float32) / 255.0
+def compute_dark_channel(image, window_size=15, downscale_factor=0.5):
+   
+    downsampled = cv2.resize(image, (0, 0), fx=downscale_factor, fy=downscale_factor)
+    min_channel = np.min(downsampled, axis=2)
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (window_size, window_size))
+    dark_channel = cv2.erode(min_channel, kernel)
+    return cv2.resize(dark_channel, (image.shape[1], image.shape[0]))
 
-    # Estimate the atmospheric light
-    dark_channel = get_dark_channel(frame)
-    atmospheric_light = estimate_atmospheric_light(frame, dark_channel)
 
-    # Estimate the transmission map
-    transmission_map = estimate_transmission(frame, atmospheric_light)
+def estimate_atmospheric_light(image, dark_channel, top_percent=0.1):
+   
+    num_pixels = int(dark_channel.size * top_percent)
+    indices = np.argpartition(dark_channel.flatten(), -num_pixels)[-num_pixels:]
+    return np.median(image.reshape(-1, 3)[indices], axis=0)
 
-    # Apply the dehazing equation
-    epsilon = 0.001
-    dehazed_frame = np.zeros_like(frame)
+
+def dehaze_frame(frame, w=0.95, guided_filter_radius=40, eps=1e-3):
+  
+    I = frame.astype(np.float32) / 255.0
+    dark_channel = compute_dark_channel(I)
+    A = estimate_atmospheric_light(I, dark_channel)
+
+    # Transmission estimation
+    normalized_I = I / A
+    transmission = 1 - w * compute_dark_channel(normalized_I)
+
+    # Guided filter refinement
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY).astype(np.float32) / 255.0
+    transmission = cv2.ximgproc.guidedFilter(gray, transmission, guided_filter_radius, eps)
+    transmission = np.clip(transmission, 0.1, 1.0)
+
+    # Scene recovery
+    J = np.empty_like(I)
     for i in range(3):
-        dehazed_frame[:, :, i] = (frame[:, :, i] - atmospheric_light[i]) / np.maximum(transmission_map, epsilon) + \
-                                 atmospheric_light[i]
+        J[:, :, i] = (I[:, :, i] - A[i]) / transmission + A[i]
 
-    # Clip values to ensure they are in valid range
-    dehazed_frame = np.clip(dehazed_frame, 0, 1)
-
-    # Convert the frame back to uint8
-    dehazed_frame = (dehazed_frame * 255).astype(np.uint8)
-
-    return dehazed_frame
-
-
-# Function to compute the dark channel prior
-def get_dark_channel(frame, window_size=15):
-    dark_channel = np.zeros((frame.shape[0], frame.shape[1]))
-    padded_frame = np.pad(frame, ((window_size // 2, window_size // 2), (window_size // 2, window_size // 2), (0, 0)),
-                          mode='edge')
-
-    for i in range(frame.shape[0]):
-        for j in range(frame.shape[1]):
-            dark_channel[i, j] = np.min(padded_frame[i:i + window_size, j:j + window_size, :])
-
-    return dark_channel
-
-
-# Function to estimate the atmospheric light
-def estimate_atmospheric_light(frame, dark_channel, percent=0.001):
-    flat_dark_channel = dark_channel.flatten()
-    num_pixels = flat_dark_channel.size
-    num_brightest_pixels = int(num_pixels * percent)
-    indices = np.argpartition(flat_dark_channel, -num_brightest_pixels)[-num_brightest_pixels:]
-    brightest_pixels = frame.reshape(-1, 3)[indices]
-    atmospheric_light = np.max(brightest_pixels, axis=0)
-    return atmospheric_light
-
-
-# Function to estimate the transmission map
-def estimate_transmission(frame, atmospheric_light, omega=0.95, window_size=15):
-    normalized_frame = frame.astype(np.float32) / np.maximum(atmospheric_light, 0.1)
-    transmission_map = 1 - omega * get_dark_channel(normalized_frame, window_size)
-    return transmission_map
+    return np.clip(J * 255, 0, 255).astype(np.uint8)
 
 
 def main():
-    # Open the webcam
-    cap = cv2.VideoCapture(0)
+    parser = argparse.ArgumentParser(description='Real-Time Image/Video Dehazing using DCP')
+    parser.add_argument('--input', type=str, default='webcam', help='Input path (image/video) or "webcam"')
+    args = parser.parse_args()
 
-    # Check if the webcam is opened successfully
-    if not cap.isOpened():
-        print("Error: Could not open webcam")
+    # Input handling
+    if args.input.lower() == 'webcam':
+        cap = cv2.VideoCapture(0)
+    elif args.input.endswith(('.jpg', '.png', '.jpeg')):
+        image = cv2.imread(args.input)
+        if image is None:
+            print(f"Error: Could not read image {args.input}")
+            return
+        dehazed = dehaze_frame(image)
+        cv2.imshow('Original', image)
+        cv2.imshow('Dehazed', dehazed)
+        cv2.waitKey(0)
+        cv2.destroyAllWindows()
         return
+    else:  # Video file
+        cap = cv2.VideoCapture(args.input)
 
+    # Video processing loop
     while True:
-        # Capture frame-by-frame
         ret, frame = cap.read()
         if not ret:
-            print("Error: Failed to capture frame")
             break
 
-        # Perform dehazing
-        dehazed_frame = dehaze(frame)
+        start_time = time.time()
+        dehazed_frame = dehaze_frame(frame)
+        fps = 1 / (time.time() - start_time)
 
-        # Display the original and dehazed frames
-        cv2.imshow('Original', frame)
-        cv2.imshow('Dehazed', dehazed_frame)
+        cv2.putText(dehazed_frame, f'FPS: {fps:.1f}', (10, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+        cv2.imshow('Hazy Input', frame)
+        cv2.imshow('Dehazed Output', dehazed_frame)
 
-        # Break the loop if 'q' is pressed
         if cv2.waitKey(1) & 0xFF == ord('q'):
             break
 
-    # Release the webcam and close all windows
     cap.release()
     cv2.destroyAllWindows()
 
